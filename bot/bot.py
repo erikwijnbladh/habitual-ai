@@ -91,14 +91,15 @@ class HabitTracker:
     
     async def add_checkin(self, user_id: str, discord_id: str, message: str = None, mood: int = None) -> dict:
         """Add a checkin for today - returns dict with success status and existing checkin info"""
-        today = date.today()
+        # Get user's timezone to determine their "today"
+        user_today = await self._get_user_date(discord_id)
         
         if USE_LOCAL_ONLY:
-            return self._add_local_checkin(discord_id, today, message, mood)
+            return self._add_local_checkin(discord_id, user_today, message, mood)
         
         try:
-            # First check if checkin already exists for today
-            existing_result = supabase.table('checkins').select('*').eq('user_id', user_id).eq('date', today.isoformat()).execute()
+            # First check if checkin already exists for today (in user's timezone)
+            existing_result = supabase.table('checkins').select('*').eq('user_id', user_id).eq('date', user_today.isoformat()).execute()
             
             if existing_result.data:
                 # Return existing checkin info for confirmation
@@ -113,7 +114,7 @@ class HabitTracker:
             # Use RPC function for checkin creation to handle RLS properly
             result = supabase.rpc('create_or_update_checkin', {
                 'p_user_discord_id': discord_id,
-                'p_date': today.isoformat(),
+                'p_date': user_today.isoformat(),
                 'p_message': message,
                 'p_mood': mood
             }).execute()
@@ -122,7 +123,24 @@ class HabitTracker:
             
         except Exception as e:
             print(f"Database error: {e}")
-            return self._add_local_checkin(discord_id, today, message, mood)
+            return self._add_local_checkin(discord_id, user_today, message, mood)
+    
+    async def _get_user_date(self, discord_id: str) -> date:
+        """Get the current date in the user's timezone"""
+        try:
+            if not USE_LOCAL_ONLY and supabase:
+                # Get user's timezone from database
+                result = supabase.table('users').select('timezone').eq('discord_id', discord_id).execute()
+                if result.data and result.data[0].get('timezone'):
+                    user_tz = pytz.timezone(result.data[0]['timezone'])
+                    return datetime.now(user_tz).date()
+            
+            # Default to UTC if no timezone is set or in local mode
+            return date.today()
+            
+        except Exception as e:
+            print(f"Error getting user timezone: {e}")
+            return date.today()
     
     def _add_local_checkin(self, discord_id: str, date_obj: date, message: str, mood: int) -> dict:
         """Add checkin to local JSON file - returns dict with success status and existing checkin info"""
@@ -172,16 +190,17 @@ class HabitTracker:
     
     async def update_checkin(self, user_id: str, discord_id: str, message: str = None, mood: int = None) -> bool:
         """Force update today's checkin (after confirmation)"""
-        today = date.today()
+        # Get user's timezone to determine their "today"
+        user_today = await self._get_user_date(discord_id)
         
         if USE_LOCAL_ONLY:
-            return self._update_local_checkin(discord_id, today, message, mood)
+            return self._update_local_checkin(discord_id, user_today, message, mood)
         
         try:
             # Use RPC function to update checkin
             result = supabase.rpc('create_or_update_checkin', {
                 'p_user_discord_id': discord_id,
-                'p_date': today.isoformat(),
+                'p_date': user_today.isoformat(),
                 'p_message': message,
                 'p_mood': mood
             }).execute()
@@ -190,7 +209,7 @@ class HabitTracker:
             
         except Exception as e:
             print(f"Database error: {e}")
-            return self._update_local_checkin(discord_id, today, message, mood)
+            return self._update_local_checkin(discord_id, user_today, message, mood)
     
     def _update_local_checkin(self, discord_id: str, date_obj: date, message: str, mood: int) -> bool:
         """Force update checkin in local JSON file"""
@@ -621,7 +640,7 @@ async def commands_list(ctx):
     
     embed.add_field(
         name="📝 Basic Commands",
-        value="`!checkin [mood] [message]` - Log today's check-in\n`!summary` - View your stats and recent entries\n`!remindme 20:00 CET` - Set daily reminder with timezone\n`!stopreminder` - Turn off reminders",
+        value="`!checkin [mood] [message]` - Log today's check-in\n`!summary` - View your stats and recent entries\n`!timezone [zone]` - Set your timezone (resets at local midnight)\n`!remindme 20:00 CET` - Set daily reminder with timezone\n`!stopreminder` - Turn off reminders",
         inline=False
     )
     
@@ -644,6 +663,81 @@ async def commands_list(ctx):
     )
     
     await ctx.send(embed=embed)
+
+@bot.command(name='timezone')
+async def set_timezone(ctx, *, timezone_str: str = None):
+    """Set your timezone for proper check-in timing (e.g., !timezone CET or !timezone Europe/Stockholm)"""
+    if not timezone_str:
+        # Show current timezone
+        user = await tracker.get_or_create_user(str(ctx.author.id), str(ctx.author))
+        
+        if not USE_LOCAL_ONLY and supabase:
+            try:
+                result = supabase.table('users').select('timezone').eq('discord_id', str(ctx.author.id)).execute()
+                if result.data and result.data[0].get('timezone'):
+                    current_tz = result.data[0]['timezone']
+                    user_tz = pytz.timezone(current_tz)
+                    now_local = datetime.now(user_tz)
+                    await ctx.send(f"🌍 Your timezone: **{current_tz}**\nLocal time: **{now_local.strftime('%Y-%m-%d %H:%M')}**\n\nCheck-ins reset at midnight in your local time! 🕛")
+                else:
+                    await ctx.send("🌍 No timezone set. Using UTC (server time).\n\nSet your timezone with: `!timezone Europe/Stockholm` or `!timezone CET`")
+            except Exception as e:
+                await ctx.send("🌍 No timezone set. Using UTC (server time).\n\nSet your timezone with: `!timezone Europe/Stockholm` or `!timezone CET`")
+        else:
+            await ctx.send("🌍 Local mode - using server timezone.\n\nSet your timezone with: `!timezone Europe/Stockholm` or `!timezone CET`")
+        return
+    
+    # Timezone mapping for common abbreviations
+    timezone_mapping = {
+        'CET': 'Europe/Berlin',
+        'CEST': 'Europe/Berlin', 
+        'EST': 'US/Eastern',
+        'EDT': 'US/Eastern',
+        'PST': 'US/Pacific',
+        'PDT': 'US/Pacific',
+        'GMT': 'GMT',
+        'UTC': 'UTC',
+        'CST': 'US/Central',
+        'CDT': 'US/Central',
+        'MST': 'US/Mountain',
+        'MDT': 'US/Mountain',
+        'JST': 'Asia/Tokyo',
+        'BST': 'Europe/London',
+        'STOCKHOLM': 'Europe/Stockholm',
+        'SWEDEN': 'Europe/Stockholm'
+    }
+    
+    # Get timezone
+    if timezone_str.upper() in timezone_mapping:
+        tz_name = timezone_mapping[timezone_str.upper()]
+        try:
+            user_tz = pytz.timezone(tz_name)
+        except pytz.UnknownTimeZoneError:
+            await ctx.send(f"❌ Error with timezone: `{tz_name}`")
+            return
+    else:
+        # Try to use it as a timezone name directly
+        try:
+            user_tz = pytz.timezone(timezone_str)
+            tz_name = timezone_str
+        except pytz.UnknownTimeZoneError:
+            await ctx.send(f"❌ Unknown timezone: `{timezone_str}`\n\n**Supported shortcuts:** CET, EST, PST, GMT, UTC, CST, MST, JST, BST, STOCKHOLM\n**Or use full names:** Europe/Stockholm, US/Eastern, Asia/Tokyo")
+            return
+    
+    # Store timezone for user
+    user = await tracker.get_or_create_user(str(ctx.author.id), str(ctx.author))
+    
+    if not USE_LOCAL_ONLY and supabase:
+        try:
+            supabase.table('users').update({
+                'timezone': tz_name
+            }).eq('discord_id', str(ctx.author.id)).execute()
+        except Exception as e:
+            print(f"Database error updating timezone: {e}")
+    
+    # Show confirmation with local time
+    now_local = datetime.now(user_tz)
+    await ctx.send(f"🌍 Timezone set to **{tz_name}**!\nYour local time: **{now_local.strftime('%Y-%m-%d %H:%M')}**\n\n✨ Check-ins now reset at midnight in your local time!")
 
 @bot.command(name='remindme')
 async def set_reminder(ctx, reminder_time: str = None, timezone_str: str = "UTC"):
