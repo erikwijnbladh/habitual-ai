@@ -2,10 +2,12 @@
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 
-app = 'habitual-ai'
-primary_region = 'iad'
+app = "habitual-ai"
+primary_region = "arn"
 
 [build]
+
+[deploy]
 
 [env]
   # These will be set via fly secrets
